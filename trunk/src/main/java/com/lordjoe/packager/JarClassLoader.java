@@ -1,13 +1,14 @@
 package com.lordjoe.packager;
 
 import java.io.*;
+import java.net.*;
 import java.util.jar.*;
 
 /**
-* com.lordjoe.packager.JarClassLoader
-* User: Steve
-* Date: 11/22/13
-*/
+ * com.lordjoe.packager.JarClassLoader
+ * User: Steve
+ * Date: 11/22/13
+ */
 class JarClassLoader extends AbstractLoggingClassFinder {
 
 
@@ -19,6 +20,7 @@ class JarClassLoader extends AbstractLoggingClassFinder {
     public boolean isJarLoader() {
         return true;
     }
+
 
     @Override
     protected InputStream getInputStream(final String className) {
@@ -34,4 +36,33 @@ class JarClassLoader extends AbstractLoggingClassFinder {
 
         }
     }
+
+
+
+    /**
+     * for files return a file urs
+     *
+     * @param className
+     * @return !null if present
+     */
+    protected URL findURl(String resourceName) {
+        try {
+            File source = getSource();
+
+            JarFile jarFile = new JarFile(source);
+            JarEntry entry = jarFile.getJarEntry(resourceName);
+            if (entry == null)
+                return null;
+
+            URI src = source.toURI();
+
+            String uri = "jar:file:/" + source.getAbsolutePath().replace("\\","/") + "!/" + resourceName;
+            return new URL(uri);
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
+
+        }
+    }
+
 }

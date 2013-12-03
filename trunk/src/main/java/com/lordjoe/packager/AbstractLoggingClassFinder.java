@@ -1,6 +1,8 @@
 package com.lordjoe.packager;
 
 import java.io.*;
+import java.net.*;
+import java.util.*;
 
 /**
 * com.lordjoe.packager.AbstractLoggingClassLoader
@@ -23,6 +25,13 @@ public abstract class AbstractLoggingClassFinder {
          return false;
      }
 
+
+    /**
+     * for files return a file urs
+     * @param className
+     * @return !null if present
+     */
+    protected abstract URL findURl(String className);
 
     protected abstract InputStream getInputStream(String className);
 
@@ -53,4 +62,8 @@ public abstract class AbstractLoggingClassFinder {
         }
     }
 
+    @Override
+    public String toString() {
+        return   source.getName();
+    }
 }

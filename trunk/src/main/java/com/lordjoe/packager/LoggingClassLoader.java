@@ -1,6 +1,8 @@
 package com.lordjoe.packager;
 
-import javax.xml.parsers.*;
+import com.sun.istack.internal.*;
+import org.apache.commons.logging.*;
+
 import java.io.*;
 import java.lang.reflect.*;
 import java.net.*;
@@ -14,20 +16,39 @@ import java.util.jar.*;
  * Date: 11/21/13
  */
 public class LoggingClassLoader extends ClassLoader {
+    public static String[] MY_PACKAGES = {   // todo dont hardcode
+            "com.lordjoe.",
+            "org.systemsbiology.",
+            "uk.ac.ebi.pride",
+    };
+
+    /**
+     * test of mine vs thirdparty code
+     *
+     * @param className test class name
+     * @return true if in my package
+     */
+    public static boolean isMyClass(@NotNull String className) {
+        for (int i = 0; i < MY_PACKAGES.length; i++) {
+            if (className.startsWith(MY_PACKAGES[i]))
+                return true;
+        }
+        return false; // not mine
+    }
 
     private List<AbstractLoggingClassFinder> classPath = new ArrayList<AbstractLoggingClassFinder>();
     private Map<String, Class<?>> classes = new HashMap<String, Class<?>>();
     private Map<String, URL> resources = new HashMap<String, URL>();
+    private Set<Class<?>> resolvedClasses = new HashSet<Class<?>>();
     private Set<AbstractLoggingClassFinder> usedJars = new HashSet<AbstractLoggingClassFinder>();
     private JarOutputStream loadedClassesStream;
     private Class<?> m_MainClass;
     private final Properties m_Properties;
 
-    protected static ClassLoader getGoodParentLoader()
-    {
+    protected static ClassLoader getGoodParentLoader() {
         Thread thread = Thread.currentThread();
         ClassLoader contextClassLoader = thread.getContextClassLoader();
-        return contextClassLoader.getParent();
+        return contextClassLoader; // todo .getParent();
     }
 
 
@@ -64,11 +85,16 @@ public class LoggingClassLoader extends ClassLoader {
      */
     @SuppressWarnings("FinalPrivateMethod")
     private final void buildPathLoaders() {
+        Set<String> existingItems = new HashSet<String>(Arrays.asList(ClassLoaderUtilities.getClassPathItems()));
+
         String cpString = getProperties().getProperty("classpath");
         String[] items = cpString.split(System.getProperty("path.separator"));
         //noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < items.length; i++) {
             String item = items[i].replace("\\", "/");
+            if (existingItems.contains(item)) {
+                continue; // already in classpath
+            }
             if (item.contains("/jre/lib"))
                 continue; // this is a jre jar
             manageClassPathElement(item);
@@ -109,7 +135,23 @@ public class LoggingClassLoader extends ClassLoader {
         }
     }
 
+    protected boolean resolveClasses() {
+        int numClasses = classes.size();
+        boolean changed = false;
+        List<Class<?>> temp  = new ArrayList<Class<?>>(classes.values());
+        for (Class<?> aClass : temp ) {
+            if (!resolvedClasses.contains(aClass)) {
+                changed = true;
+                resolveClass(aClass);
+                aClass.getDeclaredMethods();
+                resolvedClasses.add(aClass);
+            }
+        }
+        return changed || numClasses < classes.size();
+    }
+
     public void finishLoad() {
+        while(resolveClasses());
         if (loadedClassesStream != null) {
             try {
                 loadedClassesStream.close();
@@ -147,8 +189,13 @@ public class LoggingClassLoader extends ClassLoader {
         saver.closeEntry();
     }
 
-
-    public void setLoadedClasses(final File f) {
+    /**
+     * used in building jars
+     *
+     * @param f output file
+     */
+    @SuppressWarnings("UnusedDeclaration")
+    protected void setLoadedClasses(final File f) {
         try {
             setLoadedClasses(new FileOutputStream(f));
         }
@@ -165,27 +212,60 @@ public class LoggingClassLoader extends ClassLoader {
     @Override
     protected Class<?> findClass(final String className) throws ClassNotFoundException {
         Class<?> ret = classes.get(className);
-        if (ret != null)
-            return ret;
-        if(isClassHandledByExtLoader(className))   {
-            return getParent().loadClass(className);
-        }
-        ret = loadFromFinders(className);
-        if (ret != null) {
+        try {
+            if (ret != null)
+                return ret;
+            if (isClassHandledByExtLoader(className)) {
+                return getParent().loadClass(className);
+            }
+            ret = loadFromFinders(className,true);
+            if (ret != null) {
+                classes.put(className, ret);
+                return ret;
+            }
+            ret = super.findClass(className);
             classes.put(className, ret);
             return ret;
         }
-        ret = super.findClass(className);
-        return ret;
+        catch (ClassNotFoundException e) {
+            try {
+                //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+                ret = loadFromFinders(className,false);
+            }
+            catch (Exception e1) {
+                // forgive
+            }
+            // some code will fail silently when this happens
+            if (!className.endsWith("BeanInfo"))  // these are generated by introspector
+                System.out.println("could not find class " + className);
+            throw e;
+
+        }
 
     }
 
-    protected Class<?> loadFromFinders(final String className) {
+    protected Class<?> loadFromFinders(final String className, final boolean resolve) {
         for (AbstractLoggingClassFinder classLoader : classPath) {
             byte[] bytes = classLoader.getBytes(className);
             if (bytes != null) {
                 Class<?> ret = defineClass(className, bytes, 0, bytes.length, null);
                 classes.put(className, ret);
+                if (resolve ) { // isMyClass(className)) {
+                    resolveClass(ret);
+//                    try {
+//                        // force better resolution
+//                        Method[] declaredMethods = ret.getDeclaredMethods();
+//                    }
+//                    catch (SecurityException e) {
+//                        throw new RuntimeException(e);
+//
+//                    }
+//                    catch (ClassCircularityError e) {
+//                        throw new RuntimeException(e);
+//
+//                    }
+
+                }
                 usedJars.add(classLoader);
                 return ret;
             }
@@ -193,87 +273,134 @@ public class LoggingClassLoader extends ClassLoader {
         return null;
     }
 
+    /**
+     * search loaders for a resource
+     *
+     * @param resourceName
+     * @return possibly null url
+     */
+    protected URL loadURLFromFinders(@NotNull String resourceName) {
+        resourceName = resourceName.replace("\\", "/");
+        if (resourceName.startsWith("/"))
+            resourceName = resourceName.substring(1);
+        for (AbstractLoggingClassFinder classLoader : classPath) {
+            URL uRl = classLoader.findURl(resourceName);
+            if (uRl != null) {
+                usedJars.add(classLoader);
+                return uRl;
+            }
+        }
+        return null;  // not found
+    }
 
-    protected static boolean isClassHandledByExtLoader(final String className)
-    {
-        if(className.startsWith("java."))
+
+    /**
+     * if true pass system classes to parent loaders
+     *
+     * @param className
+     * @return
+     */
+    @SuppressWarnings("RedundantIfStatement")
+    protected static boolean isClassHandledByExtLoader(final String className) {
+        if (className.startsWith("java."))
             return true;
-        if(className.startsWith("javax."))
+        if (className.startsWith("javax."))
             return true;
-        if(className.startsWith("com.sun."))
+        if (className.startsWith("com.sun."))
             return true;
-        if(className.startsWith("org.xml."))
+        if (className.startsWith("org.w3c."))
+            return true;
+        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+        if (className.startsWith("org.xml."))
             return true;
 
         return false;
     }
 
+    protected static boolean isClassLoggable(final String className) {
+        if (isClassHandledByExtLoader(className))
+            return false;
+        if (className.startsWith("org.apache"))
+            return false;
+        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+        if (className.endsWith("BeanInfo"))
+            return false;
+
+        return true;
+    }
+
     @Override
     protected synchronized Class<?> loadClass(final String className, final boolean resolve) throws ClassNotFoundException {
+        boolean loggable = isClassLoggable(className);
+        try {
+            Class<?> ret = classes.get(className);
+            if (ret != null)
+                return ret;
+            if (loggable)
+                System.out.println("loading " + className);
+            if (isClassHandledByExtLoader(className)) {
+                return getParent().loadClass(className);
+            }
+            if (loggable)
+                System.out.println(" self loading " + className);
+            if("org.systemsbiology.hadoop.HadoopMajorVersion".equals(className)) {
 
-        Class<?> ret = classes.get(className);
-        if (ret != null)
+            }
+            ret = loadFromFinders(className,resolve);
+            if (ret == null) {
+                if (loggable)
+                    System.out.println(" super loading " + className);
+                ret = getParent().loadClass(className );
+                if(ret != null)  {
+                    if(resolve)
+                         resolveClass(ret);
+                    return ret;
+                }
+                ret = super.loadClass(className, resolve); // it may be in rt or not be found
+            }
             return ret;
-        if(isClassHandledByExtLoader(className))   {
-             return getParent().loadClass(className);
-         }
-        ret = loadFromFinders(className);
-        if (ret == null)
-            ret = super.loadClass(className, resolve); // it may be in rt or not be found
-        return ret;
+        }
+        catch (ClassNotFoundException e) {
+            // some code will fail silently when this happens
+            //System.out.println("could not find class " + className);
+            throw e;
+        }
     }
 
     /**
      * Finds the resource with the given name.  A resource is some data
      * (images, audio, text, etc) that can be accessed by class code in a way
      * that is independent of the location of the code.
-     * <p/>
-     * <p> The name of a resource is a '<tt>/</tt>'-separated path name that
-     * identifies the resource.
-     * <p/>
-     * <p> This method will first search the parent class loader for the
-     * resource; if the parent is <tt>null</tt> the path of the class loader
-     * built-in to the virtual machine is searched.  That failing, this method
-     * will invoke {@link #findResource(String)} to find the resource.  </p>
-     *
-     * @param name The resource name
-     * @return A <tt>URL</tt> object for reading the resource, or
-     *         <tt>null</tt> if the resource could not be found or the invoker
-     *         doesn't have adequate  privileges to get the resource.
-     * @since 1.1
      */
     @Override
     public URL getResource(final String name) {
         URL url = resources.get(name);
-        if(url != null)
+        if (url != null)
             return url;
+        url = loadURLFromFinders(name);
+        if (url != null) {
+            resources.put(name, url);
+            return url;
+        }
         url = super.getResource(name);
-        if(url != null) {
+        if (url != null) {
             resources.put(name, url);
             return url;
         }
         ClassLoader parent = getParent();
+        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
         URL resource = parent.getResource(name);
         return resource;
     }
 
     /**
      * Loads the class with the specified <a href="#name">binary name</a>.
-     * This method searches for classes in the same manner as the {@link
-     * #loadClass(String, boolean)} method.  It is invoked by the Java virtual
-     * machine to resolve class references.  Invoking this method is equivalent
-     * to invoking {@link #loadClass(String, boolean) <tt>loadClass(name,
-     * false)</tt>}.  </p>
-     *
-     * @param name The <a href="#name">binary name</a> of the class
-     * @return The resulting <tt>Class</tt> object
-     * @throws ClassNotFoundException If the class was not found
      */
     @Override
     public Class<?> loadClass(final String className) throws ClassNotFoundException {
-     //   return loadClass(className, false);
+        //   return loadClass(className, false);
         return loadClass(className, true);
-      }
+    }
 
     /**
      * Finds the resource with the given name. Class loader implementations
@@ -287,15 +414,15 @@ public class LoggingClassLoader extends ClassLoader {
     @Override
     protected URL findResource(final String name) {
         URL url = resources.get(name);
-        if(url != null)
+        if (url != null)
             return url;
         url = super.findResource(name);
-        if(url != null) {
+        if (url != null) {
             resources.put(name, url);
             return url;
         }
-         return url;
-       }
+        return url;
+    }
 
     /**
      * Finds all the resources with the given name. A resource is some data
@@ -319,6 +446,16 @@ public class LoggingClassLoader extends ClassLoader {
      */
     @Override
     public Enumeration<URL> getResources(final String name) throws IOException {
+        // if we have it give the first
+        URL url = resources.get(name);
+        if (url != null)
+            return ClassLoaderUtilities.fromItems(url);
+        url = loadURLFromFinders(name);
+        if (url != null) {
+            resources.put(name, url);
+            return ClassLoaderUtilities.fromItems(url);
+        }
+
         return super.getResources(name);    //To change body of overridden methods use File | Settings | File Templates.
     }
 
@@ -336,7 +473,16 @@ public class LoggingClassLoader extends ClassLoader {
      */
     @Override
     protected Enumeration<URL> findResources(final String name) throws IOException {
-        return super.findResources(name);    //To change body of overridden methods use File | Settings | File Templates.
+        // if we have it give the first
+        URL url = resources.get(name);
+        if (url != null)
+            return ClassLoaderUtilities.fromItems(url);
+        url = loadURLFromFinders(name);
+        if (url != null) {
+            resources.put(name, url);
+            return ClassLoaderUtilities.fromItems(url);
+        }
+        return super.findResources(name);
     }
 
     /**
@@ -353,34 +499,42 @@ public class LoggingClassLoader extends ClassLoader {
     @Override
     public InputStream getResourceAsStream(final String name) {
         URL url = getResource(name);
-        if(url == null) {
+        if (url == null) {
             ClassLoader parent = getParent();
+            //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
             InputStream resourceAsStream = parent.getResourceAsStream(name);
             return resourceAsStream;
         }
         try {
-             return url != null ? url.openStream() : null;
-         } catch (IOException e) {
-             return null;
-         }
+            return url.openStream();
+        }
+        catch (IOException e) {
+            return null;
+        }
     }
 
     public void buildHadoopJar() {
         String hadoop_jar = getProperties().getProperty("hadoop_jar");
+        Set<String> existingEntries = new HashSet<String>();
         JarOutputStream out = null;
         try {
             out = new JarOutputStream(new FileOutputStream(hadoop_jar));
 
             for (AbstractLoggingClassFinder loader : getUsedJars()) {
+                File source = loader.getSource();
                 if (loader.isJarLoader()) {
-                    File source = loader.getSource();
                     String name = source.getName();
-                    JarEntry next = new JarEntry("lib/" + name);
-                    out.putNextEntry(next);
-                    ClassLoaderUtilities.copyFile(source, out);
+                    name = "lib/" + name;
+                    if (!existingEntries.contains(name)) {
+                        existingEntries.add(name); // no duplicated allowed
+                        JarEntry next = new JarEntry(name);
+                        out.putNextEntry(next);
+                        ClassLoaderUtilities.copyFile(source, out);
+
+                    }
                 }
                 else {
-
+                    ClassLoaderUtilities.copyDirectoryToJar(source, out, existingEntries);
                 }
             }
         }
@@ -403,17 +557,28 @@ public class LoggingClassLoader extends ClassLoader {
 
     public Class<?> loadState() {
 
+        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+        String attemptLoad = null;
         try {
-            //   Thread.currentThread().setContextClassLoader(this);
+            Thread.currentThread().setContextClassLoader(this);
             Properties prop = getProperties();
             String mainclass = prop.getProperty("mainclass");
             m_MainClass = Class.forName(mainclass, true, this);
             // load other classes
             String otherClasses = prop.getProperty("load_by_name");
-            if(otherClasses != null)    {
-                String[] others = otherClasses.split(";") ;
+            if (otherClasses != null) {
+                String[] others = otherClasses.split(";");
                 for (String other : others) {
-                    Class.forName(other, true, this);
+                    //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+                    attemptLoad = other;
+                    try {
+                        Class.forName(other, true, this);
+                    }
+                    catch (ClassNotFoundException e) {
+                        // ignore
+                        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+                        attemptLoad = other; // break here
+                    }
                 }
             }
             finishLoad(); // close files
@@ -421,10 +586,11 @@ public class LoggingClassLoader extends ClassLoader {
 
             if (hadoop_jar != null)
                 buildHadoopJar();
-
-            return m_MainClass;
+           Package  myPackage = m_MainClass.getPackage();
+          return m_MainClass;
         }
         catch (ClassNotFoundException e) {
+            // some code will fail silently when this happens
             return null;
 
         }
@@ -432,10 +598,12 @@ public class LoggingClassLoader extends ClassLoader {
     }
 
     public Method getMainMethod() {
-        if (getMainClass() == null)
+        Class<?> mainClass = getMainClass();
+        if (mainClass == null)
             return null;
         try {
-            Method mainMethid = getMainClass().getMethod("main", String[].class);
+            //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+            Method mainMethid = mainClass.getMethod("main", String[].class);
             return mainMethid;
         }
         catch (NoSuchMethodException e) {
@@ -444,6 +612,7 @@ public class LoggingClassLoader extends ClassLoader {
         }
 
     }
+
 
     public static void usage() {
         System.out.println("Usage <propertyfile>");
@@ -460,29 +629,45 @@ public class LoggingClassLoader extends ClassLoader {
             return;
         }
 
+        String[] classPathItems = ClassLoaderUtilities.getClassPathItems();
+        for (int i = 0; i < classPathItems.length; i++) {
+            String classPathItem = classPathItems[i];
+            System.out.println(classPathItem);
+        }
         Properties prop = ClassLoaderUtilities.readProperties(args[0]);
         LoggingClassLoader loader = new LoggingClassLoader(prop);
 
-        Class<?> mailCls = loader.loadState();
+        Class<? extends LoggingClassLoader> aClass = loader.getClass();
+        Package pkg = aClass.getPackage();
+
+        // force early load to pick up packages
+        Class<?> aClass1 = Class.forName("org.apache.hadoop.util.VersionInfo");
+        pkg = aClass1.getPackage();
+
+        Log log = LogFactory.getLog(aClass);
+
+        //noinspection UnnecessaryLocalVariable,UnusedDeclaration,UnusedAssignment
+        Class<?> mainCls = loader.loadState();
 
         String passedargs = prop.getProperty("arguments");
-        String[] argsArray =   passedargs.trim().split(" ");
+        String[] argsArray = passedargs.trim().split(" ");
 
         System.setProperty("user.dir", prop.getProperty("user_dir"));
 
         String classPath = System.getProperty("java.class.path");
-        String[] items = classPath.split(System.getProperty("path.separator")) ;
+        String[] items = classPath.split(System.getProperty("path.separator"));
+        //noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < items.length; i++) {
             String item = items[i];
             System.out.println(item);
         }
 
-        File test = new File(args[0]);
-        boolean moved = !test.exists();
+
+        Thread.currentThread().setContextClassLoader(loader);
 
         Method mainMethod = loader.getMainMethod();
 
-        Object[] passedArgs = { argsArray };
+        Object[] passedArgs = {argsArray};
         try {
             mainMethod.invoke(null, passedArgs);
         }
@@ -497,7 +682,7 @@ public class LoggingClassLoader extends ClassLoader {
         catch (InvocationTargetException e) {
             Throwable ex = e;
             Throwable cause = ex.getCause();
-            while(cause != null && cause != ex) {
+            while (cause != null && cause != ex) {
                 ex = cause;
                 cause = ex.getCause();
             }
