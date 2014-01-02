@@ -28,6 +28,7 @@ public class LoggingClassLoader extends ClassLoader {
      * @param className test class name
      * @return true if in my package
      */
+    @SuppressWarnings("UnusedDeclaration")
     public static boolean isMyClass(@NotNull String className) {
         for (int i = 0; i < MY_PACKAGES.length; i++) {
             if (className.startsWith(MY_PACKAGES[i]))
