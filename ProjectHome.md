@@ -1,0 +1,1 @@
+Todays Java projects tend to have large lists of dependent jars. Frequently these jars are not used in many code paths including those of interest and a smaller subset is adequate. This is small main which loads a set of classes and resources building a jar containing only those needed. There is an option to package use jar files in a lib directory as specified by Hadoop.
